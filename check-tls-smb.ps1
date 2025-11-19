@@ -1,0 +1,576 @@
+﻿<#
+.SYNOPSIS
+    Disables legacy protocols TLS 1.0, TLS 1.1, and SMBv1 on Windows Server.
+
+.DESCRIPTION
+    This script disables insecure legacy protocols that are security vulnerabilities:
+    - TLS 1.0 (deprecated)
+    - TLS 1.1 (deprecated)
+    - SMBv1 (vulnerable to ransomware attacks like WannaCry)
+    
+    It also enables TLS 1.2 and TLS 1.3 (if available) and configures strong cipher suites.
+    Creates a backup and generates a detailed report.
+
+.PARAMETER BackupPath
+    Directory where backup files will be saved. Default: C:\Protocol_Disable_Backup
+
+.PARAMETER SkipBackup
+    Skip creating backup files (not recommended).
+
+.PARAMETER ForceRestart
+    Automatically restart after applying changes without prompting.
+
+.EXAMPLE
+    .\Disable-LegacyProtocols.ps1
+    
+.EXAMPLE
+    .\Disable-LegacyProtocols.ps1 -BackupPath "D:\Backups" -ForceRestart
+
+.NOTES
+    Requires Administrator privileges.
+    System restart is REQUIRED for changes to take effect.
+    Test in non-production environment first!
+    
+    Compliance: Required for PCI-DSS, HIPAA, FedRAMP, and general security best practices.
+#>
+
+param(
+    [Parameter(Mandatory=$false)]
+    [string]$BackupPath = "C:\Protocol_Disable_Backup",
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$SkipBackup,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$ForceRestart
+)
+
+#Requires -RunAsAdministrator
+
+$ErrorActionPreference = "Continue"
+$script:changesApplied = 0
+$script:changesFailed = 0
+$logFile = Join-Path $BackupPath "protocol_disable_log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet("INFO","SUCCESS","WARNING","ERROR","CRITICAL")]
+        [string]$Level = "INFO"
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$Level] $Message"
+    
+    $color = switch ($Level) {
+        "INFO" { "White" }
+        "SUCCESS" { "Green" }
+        "WARNING" { "Yellow" }
+        "ERROR" { "Red" }
+        "CRITICAL" { "Magenta" }
+    }
+    
+    Write-Host $logMessage -ForegroundColor $color
+    
+    # Create log directory if it doesn't exist
+    $logDir = Split-Path -Path $logFile -Parent
+    if (-not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+    
+    Add-Content -Path $logFile -Value $logMessage
+}
+
+function Set-RegistryValue {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [object]$Value,
+        [string]$Type = "DWord",
+        [string]$Description
+    )
+    
+    try {
+        # Create registry path if it doesn't exist
+        if (-not (Test-Path $Path)) {
+            New-Item -Path $Path -Force | Out-Null
+        }
+        
+        # Set the value
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force
+        Write-Log "✓ $Description" "SUCCESS"
+        $script:changesApplied++
+        return $true
+    }
+    catch {
+        Write-Log "✗ Failed: $Description - $($_.Exception.Message)" "ERROR"
+        $script:changesFailed++
+        return $false
+    }
+}
+
+function Backup-RegistryKey {
+    param([string]$KeyPath, [string]$BackupFile)
+    
+    if ($SkipBackup) { return }
+    
+    try {
+        reg export $KeyPath $BackupFile /y | Out-Null
+        Write-Log "Backed up registry key: $KeyPath" "INFO"
+    }
+    catch {
+        Write-Log "Warning: Could not backup $KeyPath - $($_.Exception.Message)" "WARNING"
+    }
+}
+
+function Test-ProtocolStatus {
+    Write-Host ""
+    Write-Host "═══════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "Current Protocol Status" -ForegroundColor Cyan
+    Write-Host "═══════════════════════════════════════" -ForegroundColor Cyan
+    
+    # Check TLS 1.0
+    $tls10Path = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server"
+    if (Test-Path $tls10Path) {
+        $tls10Enabled = Get-ItemProperty -Path $tls10Path -Name "Enabled" -ErrorAction SilentlyContinue
+        $status = if ($tls10Enabled.Enabled -eq 0) { "DISABLED" } else { "ENABLED" }
+        $color = if ($status -eq "DISABLED") { "Green" } else { "Red" }
+        Write-Host "TLS 1.0:  $status" -ForegroundColor $color
+    }
+    else {
+        Write-Host "TLS 1.0:  NOT CONFIGURED (likely enabled by default)" -ForegroundColor Yellow
+    }
+    
+    # Check TLS 1.1
+    $tls11Path = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server"
+    if (Test-Path $tls11Path) {
+        $tls11Enabled = Get-ItemProperty -Path $tls11Path -Name "Enabled" -ErrorAction SilentlyContinue
+        $status = if ($tls11Enabled.Enabled -eq 0) { "DISABLED" } else { "ENABLED" }
+        $color = if ($status -eq "DISABLED") { "Green" } else { "Red" }
+        Write-Host "TLS 1.1:  $status" -ForegroundColor $color
+    }
+    else {
+        Write-Host "TLS 1.1:  NOT CONFIGURED (likely enabled by default)" -ForegroundColor Yellow
+    }
+    
+    # Check TLS 1.2
+    $tls12Path = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server"
+    if (Test-Path $tls12Path) {
+        $tls12Enabled = Get-ItemProperty -Path $tls12Path -Name "Enabled" -ErrorAction SilentlyContinue
+        $status = if ($tls12Enabled.Enabled -eq 1) { "ENABLED" } else { "DISABLED" }
+        $color = if ($status -eq "ENABLED") { "Green" } else { "Red" }
+        Write-Host "TLS 1.2:  $status" -ForegroundColor $color
+    }
+    else {
+        Write-Host "TLS 1.2:  NOT CONFIGURED" -ForegroundColor Yellow
+    }
+    
+    # Check TLS 1.3
+    $tls13Path = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.3\Server"
+    if (Test-Path $tls13Path) {
+        $tls13Enabled = Get-ItemProperty -Path $tls13Path -Name "Enabled" -ErrorAction SilentlyContinue
+        $status = if ($tls13Enabled.Enabled -eq 1) { "ENABLED" } else { "DISABLED" }
+        $color = if ($status -eq "ENABLED") { "Green" } else { "Yellow" }
+        Write-Host "TLS 1.3:  $status" -ForegroundColor $color
+    }
+    else {
+        Write-Host "TLS 1.3:  NOT CONFIGURED" -ForegroundColor Yellow
+    }
+    
+    # Check SMBv1
+    try {
+        $smbv1 = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
+        if ($smbv1) {
+            $status = $smbv1.State
+            $color = if ($status -eq "Disabled") { "Green" } else { "Red" }
+            Write-Host "SMBv1:    $status" -ForegroundColor $color
+        }
+        else {
+            Write-Host "SMBv1:    NOT FOUND" -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "SMBv1:    UNABLE TO CHECK" -ForegroundColor Yellow
+    }
+    
+    Write-Host "═══════════════════════════════════════" -ForegroundColor Cyan
+}
+
+# ====================
+# Script Header
+# ====================
+Write-Host ""
+Write-Host "╔═══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+Write-Host "║     Disable Legacy Protocols - TLS 1.0/1.1 & SMBv1        ║" -ForegroundColor Cyan
+Write-Host "╚═══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Log "Starting legacy protocol disable script" "INFO"
+Write-Log "Server: $env:COMPUTERNAME" "INFO"
+Write-Log "User: $env:USERNAME" "INFO"
+Write-Log "OS: $(Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)" "INFO"
+
+# Show current status
+Test-ProtocolStatus
+
+# Create backup directory
+if (-not $SkipBackup) {
+    if (-not (Test-Path $BackupPath)) {
+        New-Item -ItemType Directory -Path $BackupPath -Force | Out-Null
+        Write-Log "Created backup directory: $BackupPath" "INFO"
+    }
+}
+
+# Warning prompt
+Write-Host ""
+Write-Host "⚠️  WARNING: This script will disable legacy protocols!" -ForegroundColor Yellow
+Write-Host "   - TLS 1.0 and TLS 1.1 will be DISABLED" -ForegroundColor Yellow
+Write-Host "   - SMBv1 will be DISABLED" -ForegroundColor Yellow
+Write-Host "   - TLS 1.2 and TLS 1.3 will be ENABLED" -ForegroundColor Yellow
+Write-Host "   - System RESTART is REQUIRED" -ForegroundColor Yellow
+Write-Host "   - Old applications/systems may lose connectivity" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "💡 Best Practice: Test in non-production environment first!" -ForegroundColor Cyan
+Write-Host ""
+
+$confirm = Read-Host "Do you want to continue? (Type 'YES' to proceed)"
+
+if ($confirm -ne "YES") {
+    Write-Log "Script cancelled by user" "WARNING"
+    exit
+}
+
+Write-Host ""
+Write-Log "Starting protocol disable process..." "INFO"
+
+# ====================
+# Backup Current Configuration
+# ====================
+if (-not $SkipBackup) {
+    Write-Host ""
+    Write-Host "[Step 1/5] Creating configuration backup..." -ForegroundColor Cyan
+    
+    $backupFile = Join-Path $BackupPath "schannel_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').reg"
+    Backup-RegistryKey -KeyPath "HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL" -BackupFile $backupFile
+    
+    $smbBackupFile = Join-Path $BackupPath "smb_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').reg"
+    Backup-RegistryKey -KeyPath "HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer" -BackupFile $smbBackupFile
+}
+
+# ====================
+# Disable TLS 1.0
+# ====================
+Write-Host ""
+Write-Host "[Step 2/5] Disabling TLS 1.0..." -ForegroundColor Cyan
+
+# Server settings
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable TLS 1.0 Server"
+
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server" `
+    -Name "DisabledByDefault" -Value 1 -Type DWord `
+    -Description "Set TLS 1.0 Server DisabledByDefault"
+
+# Client settings
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Client" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable TLS 1.0 Client"
+
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Client" `
+    -Name "DisabledByDefault" -Value 1 -Type DWord `
+    -Description "Set TLS 1.0 Client DisabledByDefault"
+
+# ====================
+# Disable TLS 1.1
+# ====================
+Write-Host ""
+Write-Host "[Step 3/5] Disabling TLS 1.1..." -ForegroundColor Cyan
+
+# Server settings
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable TLS 1.1 Server"
+
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" `
+    -Name "DisabledByDefault" -Value 1 -Type DWord `
+    -Description "Set TLS 1.1 Server DisabledByDefault"
+
+# Client settings
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Client" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable TLS 1.1 Client"
+
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Client" `
+    -Name "DisabledByDefault" -Value 1 -Type DWord `
+    -Description "Set TLS 1.1 Client DisabledByDefault"
+
+# ====================
+# Enable TLS 1.2 (Ensure it's enabled)
+# ====================
+Write-Host ""
+Write-Host "[Step 4/5] Ensuring TLS 1.2 is enabled..." -ForegroundColor Cyan
+
+# Server settings
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server" `
+    -Name "Enabled" -Value 1 -Type DWord `
+    -Description "Enable TLS 1.2 Server"
+
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server" `
+    -Name "DisabledByDefault" -Value 0 -Type DWord `
+    -Description "Set TLS 1.2 Server DisabledByDefault to 0"
+
+# Client settings
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client" `
+    -Name "Enabled" -Value 1 -Type DWord `
+    -Description "Enable TLS 1.2 Client"
+
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client" `
+    -Name "DisabledByDefault" -Value 0 -Type DWord `
+    -Description "Set TLS 1.2 Client DisabledByDefault to 0"
+
+# Enable TLS 1.2 for .NET Framework 4.x
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319" `
+    -Name "SchUseStrongCrypto" -Value 1 -Type DWord `
+    -Description "Enable strong crypto for .NET 4.x (64-bit)"
+
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319" `
+    -Name "SchUseStrongCrypto" -Value 1 -Type DWord `
+    -Description "Enable strong crypto for .NET 4.x (32-bit)"
+
+# Enable TLS 1.2 for .NET Framework 3.5
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\.NETFramework\v2.0.50727" `
+    -Name "SchUseStrongCrypto" -Value 1 -Type DWord `
+    -Description "Enable strong crypto for .NET 3.5 (64-bit)"
+
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v2.0.50727" `
+    -Name "SchUseStrongCrypto" -Value 1 -Type DWord `
+    -Description "Enable strong crypto for .NET 3.5 (32-bit)"
+
+# ====================
+# Enable TLS 1.3 (if supported - Windows Server 2022)
+# ====================
+Write-Host ""
+Write-Host "[Bonus] Attempting to enable TLS 1.3..." -ForegroundColor Cyan
+
+$osVersion = [System.Environment]::OSVersion.Version
+if ($osVersion.Major -ge 10 -and $osVersion.Build -ge 20348) {
+    # Server settings
+    Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.3\Server" `
+        -Name "Enabled" -Value 1 -Type DWord `
+        -Description "Enable TLS 1.3 Server"
+
+    Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.3\Server" `
+        -Name "DisabledByDefault" -Value 0 -Type DWord `
+        -Description "Set TLS 1.3 Server DisabledByDefault to 0"
+
+    # Client settings
+    Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.3\Client" `
+        -Name "Enabled" -Value 1 -Type DWord `
+        -Description "Enable TLS 1.3 Client"
+
+    Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.3\Client" `
+        -Name "DisabledByDefault" -Value 0 -Type DWord `
+        -Description "Set TLS 1.3 Client DisabledByDefault to 0"
+}
+else {
+    Write-Log "TLS 1.3 not supported on this OS version (requires Windows Server 2022 or newer)" "INFO"
+}
+
+# ====================
+# Disable Weak Ciphers
+# ====================
+Write-Host ""
+Write-Host "[Security] Disabling weak cipher suites..." -ForegroundColor Cyan
+
+# Disable NULL cipher
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\NULL" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable NULL cipher"
+
+# Disable DES
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\DES 56/56" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable DES 56/56 cipher"
+
+# Disable RC4
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\RC4 40/128" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable RC4 40/128 cipher"
+
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\RC4 56/128" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable RC4 56/128 cipher"
+
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\RC4 64/128" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable RC4 64/128 cipher"
+
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\RC4 128/128" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable RC4 128/128 cipher"
+
+# Disable Triple DES
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\Triple DES 168" `
+    -Name "Enabled" -Value 0 -Type DWord `
+    -Description "Disable Triple DES 168 cipher"
+
+# ====================
+# Disable SMBv1
+# ====================
+Write-Host ""
+Write-Host "[Step 5/5] Disabling SMBv1..." -ForegroundColor Cyan
+
+try {
+    # Disable SMBv1 using Windows Feature
+    $smbv1Feature = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
+    
+    if ($smbv1Feature -and $smbv1Feature.State -ne "Disabled") {
+        Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart
+        Write-Log "✓ Disabled SMBv1 Windows Feature" "SUCCESS"
+        $script:changesApplied++
+    }
+    elseif ($smbv1Feature -and $smbv1Feature.State -eq "Disabled") {
+        Write-Log "SMBv1 already disabled" "INFO"
+    }
+    else {
+        Write-Log "SMBv1 feature not found on this system" "INFO"
+    }
+}
+catch {
+    Write-Log "✗ Failed to disable SMBv1 feature: $($_.Exception.Message)" "ERROR"
+    $script:changesFailed++
+}
+
+# Disable SMBv1 at the registry level (additional layer)
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" `
+    -Name "SMB1" -Value 0 -Type DWord `
+    -Description "Disable SMBv1 on LanmanServer"
+
+# Disable SMBv1 client
+try {
+    Set-SmbClientConfiguration -EnableSMB1Protocol $false -Confirm:$false -Force
+    Write-Log "✓ Disabled SMBv1 client protocol" "SUCCESS"
+    $script:changesApplied++
+}
+catch {
+    Write-Log "✗ Failed to disable SMBv1 client: $($_.Exception.Message)" "ERROR"
+    $script:changesFailed++
+}
+
+# Disable SMBv1 server
+try {
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Confirm:$false -Force
+    Write-Log "✓ Disabled SMBv1 server protocol" "SUCCESS"
+    $script:changesApplied++
+}
+catch {
+    Write-Log "✗ Failed to disable SMBv1 server: $($_.Exception.Message)" "ERROR"
+    $script:changesFailed++
+}
+
+# ====================
+# Generate Summary Report
+# ====================
+Write-Host ""
+Write-Host "═══════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "Protocol Disable Summary" -ForegroundColor Cyan
+Write-Host "═══════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "Changes Applied:  $script:changesApplied" -ForegroundColor Green
+Write-Host "Changes Failed:   $script:changesFailed" -ForegroundColor $(if($script:changesFailed -gt 0){"Red"}else{"Green"})
+Write-Host ""
+Write-Host "Configuration Changes:" -ForegroundColor Cyan
+Write-Host "  ✓ TLS 1.0 - DISABLED" -ForegroundColor Green
+Write-Host "  ✓ TLS 1.1 - DISABLED" -ForegroundColor Green
+Write-Host "  ✓ TLS 1.2 - ENABLED" -ForegroundColor Green
+if ($osVersion.Major -ge 10 -and $osVersion.Build -ge 20348) {
+    Write-Host "  ✓ TLS 1.3 - ENABLED" -ForegroundColor Green
+}
+Write-Host "  ✓ SMBv1   - DISABLED" -ForegroundColor Green
+Write-Host "  ✓ Weak Ciphers - DISABLED" -ForegroundColor Green
+Write-Host ""
+Write-Host "Log file: $logFile" -ForegroundColor White
+Write-Host "Backup location: $BackupPath" -ForegroundColor White
+Write-Host "═══════════════════════════════════════" -ForegroundColor Cyan
+
+# ====================
+# Create HTML Report
+# ====================
+$htmlReport = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Legacy Protocol Disable Report</title>
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .container { max-width: 1000px; margin: 0 auto; background-color: white; padding: 30px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+        h2 { color: #34495e; margin-top: 30px; }
+        .status-box { padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .success { background-color: #d4edda; border-left: 4px solid #28a745; }
+        .warning { background-color: #fff3cd; border-left: 4px solid #ffc107; }
+        .info { background-color: #d1ecf1; border-left: 4px solid #17a2b8; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th { background-color: #34495e; color: white; padding: 12px; text-align: left; }
+        td { padding: 10px; border-bottom: 1px solid #ddd; }
+        .enabled { color: #28a745; font-weight: bold; }
+        .disabled { color: #dc3545; font-weight: bold; }
+        .metadata { color: #7f8c8d; font-size: 0.9em; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔒 Legacy Protocol Disable Report</h1>
+        <div class="metadata">
+            <strong>Server:</strong> $env:COMPUTERNAME<br>
+            <strong>Report Date:</strong> $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")<br>
+            <strong>OS Version:</strong> $(Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)<br>
+            <strong>Administrator:</strong> $env:USERNAME
+        </div>
+        
+        <div class="status-box success">
+            <h3 style="margin-top: 0;">✓ Changes Applied Successfully</h3>
+            <p><strong>$script:changesApplied</strong> configuration changes were applied.</p>
+        </div>
+        
+        $(if($script:changesFailed -gt 0) {
+            "<div class='status-box warning'><h3 style='margin-top: 0;'>⚠ Some Changes Failed</h3><p><strong>$script:changesFailed</strong> changes failed. Review log file for details.</p></div>"
+        })
+        
+        <div class="status-box info">
+            <h3 style="margin-top: 0;">⚠️ Restart Required</h3>
+            <p>A system restart is <strong>REQUIRED</strong> for these changes to take effect.</p>
+        </div>
+        
+        <h2>Protocol Configuration Changes</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Protocol/Feature</th>
+                    <th>Status</th>
+                    <th>Security Impact</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>TLS 1.0</strong></td>
+                    <td class="disabled">DISABLED</td>
+                    <td>Eliminated deprecated encryption protocol</td>
+                </tr>
+                <tr>
+                    <td><strong>TLS 1.1</strong></td>
+                    <td class="disabled">DISABLED</td>
+                    <td>Eliminated deprecated encryption protocol</td>
+                </tr>
+                <tr>
+                    <td><strong>TLS 1.2</strong></td>
+                    <td class="enabled">ENABLED</td>
+                    <td>Modern encryption standard enabled</td>
+                </tr>
+                $(if ($osVersion.Major -ge 10 -and $osVersion.Build -ge 20348) {
+                    "<tr><td><strong>TLS 1.3</strong></td><td class='enabled'>ENABLED</td><td>Latest encryption standard enabled</td></tr>"
+                })
+                <tr>
+                    <td><strong>SMBv1</strong></td>
+                    <td class="disabled">DISABLED</td>
+                    <td>Protected against ransomware (WannaCry, NotPetya)
